@@ -29,7 +29,7 @@ except:
             pass
 
 
-def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, max_disp=192):
+def sequence_loss(disp_preds, disp_gt, valid, loss_gamma=0.9, max_disp=192):
     """ Loss function defined over sequence of disp predictions """
 
     n_predictions = len(disp_preds)
@@ -41,7 +41,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
     assert not torch.isinf(disp_gt[valid.bool()]).any()
 
 
-    disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], size_average=True)
+    # disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], size_average=True)
     for i in range(n_predictions):
         adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
         i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
@@ -150,10 +150,10 @@ def train(args):
             image1, image2, disp_gt, valid = [x.cuda() for x in data_blob]
 
             assert model.training
-            disp_init_pred, disp_preds = model(image1, image2, iters=args.train_iters)
+            disp_preds = model(image1, image2, iters=args.train_iters)
             assert model.training
 
-            loss, metrics = sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, max_disp=args.max_disp)
+            loss, metrics = sequence_loss(disp_preds, disp_gt, valid, max_disp=args.max_disp)
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1

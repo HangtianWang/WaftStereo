@@ -438,7 +438,7 @@ class WAFTv2(nn.Module):
             disp_predictions[i] = padder.unpad(disp_predictions[i])
          
         init_disp = padder.unpad(torch.zeros((N,1,H,W)))
-        return init_disp, disp_predictions
+        return disp_predictions
     
 if __name__ == "__main__":
     # encoder使用Dinov3的vits,迭代器使用Vit的vitt
