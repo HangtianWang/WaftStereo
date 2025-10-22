@@ -292,6 +292,77 @@ class ResNet18Deconv(nn.Module):
         out_0 = self.proj_0(out_0 + self.up_1(out_1)) # H/2
         return [out_0, out_1, out_2, out_3, out_4]
 
+class Feat_transfer(nn.Module):
+    def __init__(self, dim_encoder):
+        super(Feat_transfer, self).__init__()
+        self.conv2x = nn.Sequential(
+            nn.Conv2d(in_channels=int(48+dim_encoder), out_channels=48, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm2d(48), nn.ReLU()
+            )
+        self.conv4x = nn.Sequential(
+            nn.Conv2d(in_channels=int(64+dim_encoder), out_channels=64, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm2d(64), nn.ReLU()
+            )
+        self.conv8x = nn.Sequential(
+            nn.Conv2d(in_channels=int(192+dim_encoder), out_channels=192, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm2d(192), nn.ReLU()
+            )
+        self.conv16x = nn.Sequential(
+            nn.Conv2d(in_channels=dim_encoder, out_channels=160, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm2d(160), nn.ReLU()
+            )
+        self.conv_up_16x = nn.ConvTranspose2d(160,
+                                192,
+                                kernel_size=3,
+                                padding=1,
+                                output_padding=1,
+                                stride=2,
+                                bias=False)
+        self.conv_up_8x = nn.ConvTranspose2d(192,
+                                64,
+                                kernel_size=3,
+                                padding=1,
+                                output_padding=1,
+                                stride=2,
+                                bias=False)
+        self.conv_up_4x = nn.ConvTranspose2d(64,
+                                48,
+                                kernel_size=3,
+                                padding=1,
+                                output_padding=1,
+                                stride=2,
+                                bias=False)
+        
+        self.res_8x = nn.Conv2d(dim_encoder, 192, kernel_size=1, padding=0, stride=1)
+        self.res_4x = nn.Conv2d(dim_encoder, 64, kernel_size=1, padding=0, stride=1)
+        self.res_2x = nn.Conv2d(dim_encoder, 48, kernel_size=1, padding=0, stride=1)
+
+    # features_left_2x: (1, 64, H/2, W/2)
+    # features_left_4x: (1, 64, H/4, W/4)
+    # features_left_8x:(1, 64, H/8, W/8)
+    # features_left_16x:(1, 64, H/16, W/16)
+    def forward(self, features):
+        features_mono_list = []
+        # (1, 160, H/16, W/16)
+        feat_16x = self.conv16x(features[3])
+        # (1, 192, H/8, W/8)
+        feat_8x_up = self.conv_up_16x(feat_16x)
+        # (1, 192, H/8, W/8)
+        feat_8x = self.conv8x(torch.cat((features[2], feat_8x_up), 1)) + self.res_8x(features[2])
+        # (1, 64, H/4, W/4)
+        feat_4x_up = self.conv_up_8x(feat_8x)
+        # (1, 64, H/4, W/4)
+        feat_4x = self.conv4x(torch.cat((features[1], feat_4x_up), 1)) + self.res_4x(features[1])
+        # (1, 48, H/2, W/2)
+        feat_2x_up = self.conv_up_4x(feat_4x)
+        # (1, 48, H/2, W/2)
+        feat_2x = self.conv2x(torch.cat((features[0], feat_2x_up), 1)) + self.res_2x(features[0])
+        features_mono_list.append(feat_2x)
+        features_mono_list.append(feat_4x)
+        features_mono_list.append(feat_8x)
+        features_mono_list.append(feat_16x)
+        return features_mono_list
+
 class WAFTv2(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -337,6 +408,7 @@ class WAFTv2(nn.Module):
         self.spx_2_gru = Conv2x(32, 32, True)
         self.spx_gru = nn.Sequential(nn.ConvTranspose2d(2*32, 9, kernel_size=4, stride=2, padding=1),)
 
+        self.feat_transfer = Feat_transfer(self.pretrain_dim)
 
     def upsample_data(self, flow, info, mask):
         # WAFT原设计,从[B,1,H/4,W/4]的视差或者[B,2,H/4,W/4]的光流,利用[B,4,H/4,W/4]的info,[N,144,H/4,W/4]的mask权重
@@ -387,17 +459,20 @@ class WAFTv2(nn.Module):
         image2 = padder.pad(image2)
         disp_predictions = []
         N, _, H, W = image1.shape
-        # encoder是预训练模型，输出[B,64,H/4,W/4]
-        fmap1_pretrain = self.encoder(image1)
-        fmap2_pretrain = self.encoder(image2)
+        # encoder是预训练模型，输出[B,64,H/2,W/2],[B,64,H/4,W/4],[B,64,H/8,W/8][B,64,H/16,W/16]
+        fmap1_encoder_list = self.encoder(image1)
+        fmap2_encoder_list = self.encoder(image2)
+        # 可训练的残差头，输出一组特征图，其中第2个尺寸为[1, 64, H/4, W/4]
+        fmap1_pretrain_list = self.feat_transfer(fmap1_encoder_list)
+        fmap2_pretrain_list = self.feat_transfer(fmap2_encoder_list)
         # 残差块，输出[B,64,H/4,W/4]
         fmap1_img = self.fnet(image1)[1]
         fmap2_img = self.fnet(image2)[1]
         # 用于指导上采样[B,64,H/2,W/2]
         fmap1_img_2x = self.fnet(image1)[0]
         # 单层卷积，映射到指定尺寸，输出为[B, D_iter=32, H//4, W//4]
-        fmap1_4x = self.fmap_conv(torch.cat([fmap1_pretrain, fmap1_img], dim=1))
-        fmap2_4x = self.fmap_conv(torch.cat([fmap2_pretrain, fmap2_img], dim=1))
+        fmap1_4x = self.fmap_conv(torch.cat([fmap1_pretrain_list[1], fmap1_img], dim=1))
+        fmap2_4x = self.fmap_conv(torch.cat([fmap2_pretrain_list[1], fmap2_img], dim=1))
         # 单层卷积，融合左右图，输出net为[B, D_iter=32, H//4, W//4]
         net = self.hidden_conv(torch.cat([fmap1_4x, fmap2_4x], dim=1))
         # init disp 从0开始
@@ -456,7 +531,7 @@ if __name__ == "__main__":
         image1 = torch.randn(1, 3, 128, 128)
         image2 = torch.randn(1, 3, 128, 128)
 
-        init_disp, disp_predictions = model(image1, image2)
+        disp_predictions = model(image1, image2)
         print(f"the first step output is {disp_predictions[0].shape}")
         print(f"iter steps is {len(disp_predictions)}")
 
@@ -472,11 +547,11 @@ if __name__ == "__main__":
         image1 = to_tensor(left).unsqueeze(0) * 255.0
         image2 = to_tensor(right).unsqueeze(0) * 255.0
 
-        init_disp, disp_predictions = model(image1, image2)
+        disp_predictions = model(image1, image2)
         disp = disp_predictions[-1].squeeze().cpu().numpy()
         plt.imshow(disp, cmap="plasma")
         plt.colorbar()
-        plt.savefig("demo-imgs/Motorcycle/disp4x_IGEvHead.png", dpi=200)
+        plt.savefig("demo-imgs/Motorcycle/disp4x_featTransfer.png", dpi=200)
         plt.show()
 
     test_waftv2_forward_smoke2()

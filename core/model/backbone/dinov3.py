@@ -58,8 +58,9 @@ class DinoV3Feature(nn.Module):
         patch_size = self.encoder.patch_size
         patch_h, patch_w = h // patch_size, w // patch_size
         outs = self.dpt_head.forward(features, patch_h, patch_w)
-        final = F.interpolate(outs[0], size=(h//4, w//4), mode='bilinear', align_corners=True)
-        return final
+        # 一个特征图列表[1,64,H/2,W/2],[1,64,H/4,W/4],[1,64,H/8,W/8],[1,64,H/16,W/16]
+        # final = F.interpolate(outs[0], size=(h//4, w//4), mode='bilinear', align_corners=True)
+        return outs
 
 if __name__ == '__main__':
     model = DinoV3Feature(model_name='vits', lvl=-3)
