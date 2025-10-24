@@ -22,7 +22,7 @@ WEIGHTS_URLS = {
 }
 
 class DinoV3Feature(nn.Module):
-    def __init__(self, model_name='vits', lvl=-3):
+    def __init__(self, model_name='vits', lvl=-2):
         super().__init__()
         self.dpt_configs = {
             'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024], "dim": 1024},
@@ -58,7 +58,7 @@ class DinoV3Feature(nn.Module):
         patch_size = self.encoder.patch_size
         patch_h, patch_w = h // patch_size, w // patch_size
         outs = self.dpt_head.forward(features, patch_h, patch_w)
-        # 一个特征图列表[1,64,H/2,W/2],[1,64,H/4,W/4],[1,64,H/8,W/8],[1,64,H/16,W/16]
+        # 一个特征图列表，这里修改了lvl为-2，故为[1,64,H/4,W/4],[1,64,H/8,W/8],[1,64,H/16,W/16]，[1,64,H/32,W/32],
         # final = F.interpolate(outs[0], size=(h//4, w//4), mode='bilinear', align_corners=True)
         return outs
 
