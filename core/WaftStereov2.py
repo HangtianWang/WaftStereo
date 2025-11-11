@@ -1,4 +1,4 @@
-# 参考IGEV，构建代价体，从代价体中回归得到初始视差图
+# 参考STTR，从注意力图中得到代价体
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
