@@ -18,6 +18,8 @@ from core.model.backbone.waftv2_dav2 import DepthAnythingFeature
 from core.model.backbone.dinov3 import DinoV3Feature
 from core.model.backbone.vit import VisionTransformer, MODEL_CONFIGS
 
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2_decoder
+
 from core.utils.utils import coords_grid, Padder, bilinear_sampler, bilinear_sampler_2d
 
 try:
@@ -239,6 +241,20 @@ class WAFTv2(nn.Module):
         else:
             raise ValueError(f"Unknown feature encoder: {args.feature_encoder}")
 
+        mono_model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
+
+        self.intermediate_layer_idx = {
+            'vits': [2, 5, 8, 11],
+            'vitb': [2, 5, 8, 11], 
+            'vitl': [4, 11, 17, 23], 
+            'vitg': [9, 19, 29, 39]
+        }
+
         self.pretrain_dim = self.encoder.output_dim
         self.fnet = ResNet18Deconv(3, self.pretrain_dim)
         self.iter_dim = MODEL_CONFIGS[args.iterative_module]['features']
@@ -282,6 +298,35 @@ class WAFTv2(nn.Module):
             nn.Conv2d(24, 24, 3, 1, 1, bias=False),
             nn.InstanceNorm2d(24), nn.ReLU()
             )
+        
+        depth_anything = DepthAnythingV2(**mono_model_configs[args.encoder])
+        depth_anything_decoder = DepthAnythingV2_decoder(**mono_model_configs[args.encoder])
+        state_dict_dpt = torch.load(f'/data/wht/checkpoints/monster/depth_anything_v2_vitl.pth', map_location='cpu')
+        depth_anything.load_state_dict(state_dict_dpt, strict=True)
+        depth_anything_decoder.load_state_dict(state_dict_dpt, strict=False)
+        self.mono_encoder = depth_anything.pretrained
+        self.mono_decoder = depth_anything.depth_head
+        self.feat_decoder = depth_anything_decoder.depth_head
+        self.mono_encoder.requires_grad_(False)
+        self.mono_decoder.requires_grad_(False)
+
+        del depth_anything, state_dict_dpt, depth_anything_decoder
+        
+    def infer_mono(self, image1, image2):
+        height_ori, width_ori = image1.shape[2:]
+        resize_image1 = F.interpolate(image1, scale_factor=14 / 16, mode='bilinear', align_corners=True)
+        resize_image2 = F.interpolate(image2, scale_factor=14 / 16, mode='bilinear', align_corners=True)
+
+        patch_h, patch_w = resize_image1.shape[-2] // 14, resize_image1.shape[-1] // 14
+        features_left_encoder = self.mono_encoder.get_intermediate_layers(resize_image1, self.intermediate_layer_idx[self.args.encoder], return_class_token=True)
+        features_right_encoder = self.mono_encoder.get_intermediate_layers(resize_image2, self.intermediate_layer_idx[self.args.encoder], return_class_token=True)
+        depth_mono = self.mono_decoder(features_left_encoder, patch_h, patch_w)
+        depth_mono = F.relu(depth_mono)
+        depth_mono = F.interpolate(depth_mono, size=(height_ori, width_ori), mode='bilinear', align_corners=False)
+        features_left_4x, features_left_8x, features_left_16x, features_left_32x = self.feat_decoder(features_left_encoder, patch_h, patch_w)
+        features_right_4x, features_right_8x, features_right_16x, features_right_32x = self.feat_decoder(features_right_encoder, patch_h, patch_w)
+
+        return depth_mono, [features_left_4x, features_left_8x, features_left_16x, features_left_32x], [features_right_4x, features_right_8x, features_right_16x, features_right_32x]
 
     def upsample_data(self, flow, info, mask):
         # WAFT原设计,从[B,1,H/4,W/4]的视差或者[B,2,H/4,W/4]的光流,利用[B,4,H/4,W/4]的info,[N,144,H/4,W/4]的mask权重
@@ -352,6 +397,7 @@ class WAFTv2(nn.Module):
         # 卷积聚合,[B,8,maxdisp//4,H/4,W/4]
         gwc_volume = self.corr_stem(gwc_volume)
         # 融合特征图,从左特征图得到注意力图，加权到代价体上，[B,8,maxdisp//4,H/4,W/4]
+        # 两个输入形状分别为 [B,8,maxdisp//4,H/4,W/4], [B,112,H/4,W/4]
         gwc_volume = self.corr_feature_att(gwc_volume, torch.cat([fmap1_pretrain_list[0], fmap1_img_list[1]], dim=1))
         # 沙漏聚合，[B,8,maxdisp//4,H/4,W/4]
         geo_encoding_volume = self.cost_agg(gwc_volume, fmap1_pretrain_list)
@@ -359,6 +405,15 @@ class WAFTv2(nn.Module):
         prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
         # [B,1,H/4,W/4]
         init_disp = disparity_regression(prob, self.max_disp//4)
+        
+        # 单目分支
+        with torch.autocast(device_type='cuda', dtype=torch.float32): 
+            depth_mono, features_mono_left,  features_mono_right = self.infer_mono(image1, image2)
+        # 下采样到1/4
+        scale_factor = 0.25
+        size = (int(depth_mono.shape[-2] * scale_factor), int(depth_mono.shape[-1] * scale_factor))
+        # 经过校对，disp_mono和上面init_disp的形状是一样的
+        disp_mono_4x = F.interpolate(depth_mono, size=size, mode='bilinear', align_corners=False)
         
         # 指导初始视差图上采样
         # [B,24,H/4,W/4]
@@ -411,14 +466,15 @@ if __name__ == "__main__":
             self.feature_encoder = "dinov3"
             self.iterative_module = next(iter(MODEL_CONFIGS))
             self.train_iters = 5
+            self.encoder = 'vitl'
 
 
     @torch.no_grad()
     def test_waftv2_forward_smoke():
         args = Args()
-        model = WAFTv2(args).eval()
-        image1 = torch.randn(1, 3, 128, 128)
-        image2 = torch.randn(1, 3, 128, 128)
+        model = WAFTv2(args).eval().cuda()
+        image1 = torch.randn(1, 3, 128, 128, device="cuda")
+        image2 = torch.randn(1, 3, 128, 128, device="cuda")
 
         init_disp, disp_predictions = model(image1, image2)
         print(f"the first step output is {disp_predictions[0].shape}")
@@ -443,4 +499,4 @@ if __name__ == "__main__":
         plt.savefig("demo-imgs/Motorcycle/disp4x_cost_volume.png", dpi=200)
         plt.show()
 
-    test_waftv2_forward_smoke2()
+    test_waftv2_forward_smoke()

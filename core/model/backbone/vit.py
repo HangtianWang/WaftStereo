@@ -20,7 +20,7 @@ class VisionTransformer(nn.Module):
         super(VisionTransformer, self).__init__()
         model = timm.create_model(
             MODEL_CONFIGS[model_name]['encoder'],
-            pretrained=True,
+            pretrained=False, # 暂时为了验证数据流可行性，这里pretrain先改为false
             num_classes=0,  # remove classifier nn.Linear
         )
         self.intermediate_layer_idx = {

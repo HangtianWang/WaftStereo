@@ -234,6 +234,8 @@ class FeatureAtt(nn.Module):
     def forward(self, cv, feat):
         '''
         '''
+        # 两个输入形状分别为 [B,112,H/4,W/4], [B,8,maxdisp//4,H/4,W/4]
+        # feat_att的形状为 [B,8,1,H/4,W/4]
         feat_att = self.feat_att(feat).unsqueeze(2)
         cv = torch.sigmoid(feat_att)*cv
         return cv

@@ -16,7 +16,7 @@ Please request the weights from https://ai.meta.com/dinov3/ and fill in the link
 '''
 
 WEIGHTS_URLS = {
-    'vits': 'weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth',
+    'vits': '/data/wht/checkpoints/waftstereo/dinov3_vits16_pretrain_lvd1689m-08c60483.pth',
     'vitb': None,
     'vitl': None
 }
