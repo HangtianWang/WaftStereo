@@ -240,6 +240,34 @@ class FeatureAtt(nn.Module):
         cv = torch.sigmoid(feat_att)*cv
         return cv
 
+
+class DisparityAtt(nn.Module):
+    def __init__(self, maxdisp, learnable_sigma=True):
+        super(DisparityAtt, self).__init__()
+        self.D = maxdisp 
+        self.register_buffer('disp_grid', torch.arange(self.D, dtype=torch.float32).view(1, 1, self.D, 1, 1))
+
+        if learnable_sigma:
+            self.sigma = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.sigma = 1.0
+
+    def forward(self, cv, pred_disp):
+        # [B, 1, 1, H/4, W/4]
+        norm_disp = pred_disp.unsqueeze(2)
+        
+        # dist: [B, 1, maxdisp/4, H/4, W/4] -> 每个像素点上，各个视差候选值距离预测值的距离
+        dist = self.disp_grid - norm_disp
+
+        sigma = torch.clamp(torch.abs(self.sigma), min=0.1)
+        
+        # 计算权重，形状为 [B, 1, maxdisp/4, H/4, W/4]
+        disp_att = torch.exp(- (dist ** 2) / (2 * sigma ** 2))
+        # cv: [B, C, maxdisp/4, H/4, W/4] * disp_att: [B, 1, maxdisp/4, H/4, W/4]
+        output = cv * disp_att
+        
+        return output
+
 def context_upsample(disp_low, up_weights):
     ###
     # cv (b,1,h,w)

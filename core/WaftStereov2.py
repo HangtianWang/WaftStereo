@@ -13,14 +13,23 @@ from core.extractor import MultiBasicEncoder, Feature
 from core.geometry import Combined_Geo_Encoding_Volume
 from core.submodule import *
 
+# backbone选择
 from core.model.backbone.twins import TwinsFeatureEncoder
 from core.model.backbone.waftv2_dav2 import DepthAnythingFeature
 from core.model.backbone.dinov3 import DinoV3Feature
+# 迭代器预训练模型
 from core.model.backbone.vit import VisionTransformer, MODEL_CONFIGS
 
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2_decoder
+from core.thirdparty.DepthAnythingV2.depth_anything_v2_2.dpt import DepthAnythingV2, DepthAnythingV2_decoder
 
 from core.utils.utils import coords_grid, Padder, bilinear_sampler, bilinear_sampler_2d
+
+MONO_MODEL_CONFIG = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -241,13 +250,6 @@ class WAFTv2(nn.Module):
         else:
             raise ValueError(f"Unknown feature encoder: {args.feature_encoder}")
 
-        mono_model_configs = {
-            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-        }
-
         self.intermediate_layer_idx = {
             'vits': [2, 5, 8, 11],
             'vitb': [2, 5, 8, 11], 
@@ -299,8 +301,8 @@ class WAFTv2(nn.Module):
             nn.InstanceNorm2d(24), nn.ReLU()
             )
         
-        depth_anything = DepthAnythingV2(**mono_model_configs[args.encoder])
-        depth_anything_decoder = DepthAnythingV2_decoder(**mono_model_configs[args.encoder])
+        depth_anything = DepthAnythingV2(**MONO_MODEL_CONFIG[args.encoder])
+        depth_anything_decoder = DepthAnythingV2_decoder(**MONO_MODEL_CONFIG[args.encoder])
         state_dict_dpt = torch.load(f'/data/wht/checkpoints/monster/depth_anything_v2_vitl.pth', map_location='cpu')
         depth_anything.load_state_dict(state_dict_dpt, strict=True)
         depth_anything_decoder.load_state_dict(state_dict_dpt, strict=False)
@@ -309,6 +311,7 @@ class WAFTv2(nn.Module):
         self.feat_decoder = depth_anything_decoder.depth_head
         self.mono_encoder.requires_grad_(False)
         self.mono_decoder.requires_grad_(False)
+        self.disp_att = DisparityAtt(self.max_disp//4)
 
         del depth_anything, state_dict_dpt, depth_anything_decoder
         
@@ -412,8 +415,32 @@ class WAFTv2(nn.Module):
         # 下采样到1/4
         scale_factor = 0.25
         size = (int(depth_mono.shape[-2] * scale_factor), int(depth_mono.shape[-1] * scale_factor))
-        # 经过校对，disp_mono和上面init_disp的形状是一样的
+        # 经过校对，disp_mono和上面init_disp的形状是一样的,为[B,1,H/4,W/4]
         disp_mono_4x = F.interpolate(depth_mono, size=size, mode='bilinear', align_corners=False)
+
+        # 双目初始视差指导对齐单目逆视差
+        bs = init_disp.shape[0]
+        mono = disp_mono_4x.view(bs, -1)
+        gt = init_disp.view(bs, -1)
+        mask = (gt > 0) & (mono > 1e-2)
+
+        count = mask.sum(dim=1, keepdim=True).clamp_min(1)
+        mono_mean = (mono * mask).sum(dim=1, keepdim=True) / count
+        gt_mean = (gt * mask).sum(dim=1, keepdim=True) / count
+
+        mono_centered = (mono - mono_mean) * mask
+        gt_centered = (gt - gt_mean) * mask
+        denom = mono_centered.square().sum(dim=1, keepdim=True) + 1e-6
+        scale = (mono_centered * gt_centered).sum(dim=1, keepdim=True) / denom
+        shift = gt_mean - scale * mono_mean
+
+        disp_mono_4x = disp_mono_4x * scale.view(bs, 1, 1, 1) + shift.view(bs, 1, 1, 1)
+        # 利用单目视差图沿视差维度增强代价体
+        gwc_volume = self.disp_att(gwc_volume, disp_mono_4x)
+        # Init disp from geometry encoding volume [B,maxdisp//4,H/4,W/4]
+        prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
+        # [B,1,H/4,W/4]
+        init_disp = disparity_regression(prob, self.max_disp//4)
         
         # 指导初始视差图上采样
         # [B,24,H/4,W/4]
@@ -484,19 +511,19 @@ if __name__ == "__main__":
     @torch.no_grad()
     def test_waftv2_forward_smoke2():
         args = Args()
-        model = WAFTv2(args).eval()
+        model = WAFTv2(args).eval().cuda()
 
         left = Image.open("demo-imgs/Motorcycle/im0.png").convert("RGB")
         right = Image.open("demo-imgs/Motorcycle/im0.png").convert("RGB")
         to_tensor = torchvision.transforms.ToTensor()
-        image1 = to_tensor(left).unsqueeze(0) * 255.0
-        image2 = to_tensor(right).unsqueeze(0) * 255.0
+        image1 = (to_tensor(left).unsqueeze(0) * 255.0).cuda()
+        image2 = (to_tensor(right).unsqueeze(0) * 255.0).cuda()
 
         init_disp, disp_predictions = model(image1, image2)
         disp = disp_predictions[-1].squeeze().cpu().numpy()
         plt.imshow(disp, cmap="plasma")
         plt.colorbar()
-        plt.savefig("demo-imgs/Motorcycle/disp4x_cost_volume.png", dpi=200)
+        plt.savefig("demo-imgs/Motorcycle/disp4x_mono_new_costvolume.png", dpi=200)
         plt.show()
 
-    test_waftv2_forward_smoke()
+    test_waftv2_forward_smoke2()

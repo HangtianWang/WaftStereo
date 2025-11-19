@@ -20,9 +20,15 @@ class VisionTransformer(nn.Module):
         super(VisionTransformer, self).__init__()
         model = timm.create_model(
             MODEL_CONFIGS[model_name]['encoder'],
-            pretrained=False, # 暂时为了验证数据流可行性，这里pretrain先改为false
+            pretrained=False,
             num_classes=0,  # remove classifier nn.Linear
         )
+        self.checkpoint_path = "/data/wht/checkpoints/waftstereo/vit_tiny_patch16_224.bin"
+        state = torch.load(self.checkpoint_path, map_location="cpu")
+        state.pop("head.weight", None)
+        state.pop("head.bias", None)
+        model.load_state_dict(state, strict=False)
+
         self.intermediate_layer_idx = {
             'vitt': [2, 5, 8, 11],
             'vits': [2, 5, 8, 11],

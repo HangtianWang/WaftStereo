@@ -14,9 +14,9 @@ REPO_DIR = "core/thirdparty/dinov3"
 '''
 Please request the weights from https://ai.meta.com/dinov3/ and fill in the links below.
 '''
-
+# 必须是url形式，如果是普通文件路径形式，torch.hub.load无法识别，还是默认从hub下载权重
 WEIGHTS_URLS = {
-    'vits': '/data/wht/checkpoints/waftstereo/dinov3_vits16_pretrain_lvd1689m-08c60483.pth',
+    'vits': "file:///data/wht/checkpoints/waftstereo/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
     'vitb': None,
     'vitl': None
 }
