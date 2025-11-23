@@ -1,4 +1,8 @@
 # 参考STTR，从注意力图中得到代价体
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -417,8 +421,10 @@ class WAFTv2(nn.Module):
         size = (int(depth_mono.shape[-2] * scale_factor), int(depth_mono.shape[-1] * scale_factor))
         # 经过校对，disp_mono和上面init_disp的形状是一样的,为[B,1,H/4,W/4]
         disp_mono_4x = F.interpolate(depth_mono, size=size, mode='bilinear', align_corners=False)
+        # 从逆视差图转化为视差图
+        disp_mono_4x = 1.0/disp_mono_4x
 
-        # 双目初始视差指导对齐单目逆视差
+        # 双目初始视差指导对齐单目视差
         bs = init_disp.shape[0]
         mono = disp_mono_4x.view(bs, -1)
         gt = init_disp.view(bs, -1)
@@ -435,7 +441,8 @@ class WAFTv2(nn.Module):
         shift = gt_mean - scale * mono_mean
 
         disp_mono_4x = disp_mono_4x * scale.view(bs, 1, 1, 1) + shift.view(bs, 1, 1, 1)
-        # 利用单目视差图沿视差维度增强代价体
+
+        # 利用对齐后的单目视差图沿视差维度增强代价体，获得新的初始视差
         gwc_volume = self.disp_att(gwc_volume, disp_mono_4x)
         # Init disp from geometry encoding volume [B,maxdisp//4,H/4,W/4]
         prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
@@ -523,7 +530,7 @@ if __name__ == "__main__":
         disp = disp_predictions[-1].squeeze().cpu().numpy()
         plt.imshow(disp, cmap="plasma")
         plt.colorbar()
-        plt.savefig("demo-imgs/Motorcycle/disp4x_mono_new_costvolume.png", dpi=200)
+        plt.savefig("demo-imgs/Motorcycle/disp4x_mono_new_costvolume2.png", dpi=200)
         plt.show()
 
-    test_waftv2_forward_smoke2()
+    test_waftv2_forward_smoke()

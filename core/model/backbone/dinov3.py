@@ -10,7 +10,8 @@ import os
 from core.model.backbone.head import DPTHead
 
 REPO_DIR = "core/thirdparty/dinov3"
-
+# 供调试
+# REPO_DIR = "WaftStereo/core/thirdparty/dinov3"
 '''
 Please request the weights from https://ai.meta.com/dinov3/ and fill in the links below.
 '''
